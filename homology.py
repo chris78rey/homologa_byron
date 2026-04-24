@@ -79,10 +79,12 @@ class HomologacionItem:
     score_actual_nueva: float = 0.0
     
     # Resultado del análisis
-    accion: str = ""
+    accion: str = ""  # ACCION_SUGERIDA: UPDATE, INSERT, OMITIR
+    accion_final: str = ""  # Decisión final del usuario
     status: str = ""
     aplicar: bool = False
     decision: str = ""
+    motivo_riesgo: str = ""
     
     # Equivalencias
     tiene_equivalencias: bool = False
@@ -97,6 +99,43 @@ class HomologacionItem:
             descripcion_nueva=str(row.get('DESCRIPCION_NUEVA', '')).strip(),
             tipo=str(row.get('TIPO', 'M')).strip() or 'M',
         )
+    
+    def get_opciones_disponibles(self) -> list:
+        """Retorna las opciones válidas según el estado actual."""
+        opciones = []
+        
+        if self.existe_actual and not self.existe_nuevo:
+            if self.tiene_equivalencias:
+                # Tiene equivalencias - migración segura
+                opciones = [
+                    "UPDATE_SOLO_DESCRIPCION",
+                    "MIGRAR_CODIGO_Y_EQUIVALENCIAS",
+                    "OMITIR"
+                ]
+            else:
+                # No tiene equivalencias - puede hacer UPDATE directo
+                opciones = [
+                    "UPDATE_CODIGO_DESCRIPCION",
+                    "UPDATE_SOLO_DESCRIPCION",
+                    "OMITIR"
+                ]
+        elif not self.existe_actual and not self.existe_nuevo:
+            # Ninguno existe - puede INSERT
+            opciones = ["INSERT_NUEVO", "OMITIR"]
+        elif self.existe_actual and self.existe_nuevo and self.codigo_actual == self.codigo_nuevo:
+            # Mismo código - solo descripción
+            opciones = ["UPDATE_SOLO_DESCRIPCION", "OMITIR"]
+        elif self.existe_nuevo:
+            # Código nuevo ya existe
+            opciones = [
+                "ACTUALIZAR_DESC_DEL_NUEVO",
+                "MOVER_EQUIVALENCIAS_AL_NUEVO",
+                "OMITIR"
+            ]
+        else:
+            opciones = ["OMITIR"]
+        
+        return opciones if opciones else ["OMITIR"]
 
 
 class HomologacionEngine:
@@ -250,12 +289,14 @@ class HomologacionEngine:
             return False
     
     def analizar(self) -> dict:
-        """Analiza todos los items y determina acciones."""
+        """Analiza todos los items y determina acciones sugeridas."""
         stats = {
             'total': len(self.items),
-            'update': 0,
-            'insert': 0,
-            'bloqueado': 0,
+            'update_auto': 0,  # UPDATE directo (sin equivs)
+            'insert': 0,         # INSERT nuevo
+            'migrar': 0,         # MIGRAR código y equivs
+            'requiere_decision': 0,  # REQUIERE_DECISION_HUMANA
+            'no_aplicable': 0,    # NO_APLICABLE_TECNICO
             'alta_confianza': 0,
             'media_confianza': 0,
             'baja_confianza': 0,
@@ -290,51 +331,79 @@ class HomologacionEngine:
             score_max = max(item.score_oracle_excel, item.score_actual_nueva)
             item.decision = self._decision_from_score(score_max)
             
-            # Determinar acción
+            # Determinar acción sugerida
             if item.existe_actual and not item.existe_nuevo:
                 item.tiene_equivalencias = self._check_equivalencias(item.codigo_actual)
                 
                 if item.tiene_equivalencias:
-                    item.accion = "BLOQUEADO"
-                    item.status = "TIENE_EQUIVALENCIAS"
+                    item.accion = "MIGRAR_CODIGO_Y_EQUIVALENCIAS"
+                    item.status = "REQUIERE_DECISION_HUMANA"
+                    item.motivo_riesgo = "Código tiene equivalencias - requiere migración"
                     item.aplicar = False
-                    stats['bloqueado'] += 1
+                    item.accion_final = ""
+                    stats['migrar'] += 1
+                elif item.decision == "ALTA_CONFIANZA":
+                    item.accion = "UPDATE_CODIGO_DESCRIPCION"
+                    item.status = "APLICABLE_AUTOMATICO"
+                    item.motivo_riesgo = ""
+                    item.aplicar = True
+                    item.accion_final = "UPDATE_CODIGO_DESCRIPCION"
+                    stats['update_auto'] += 1
                 else:
-                    item.accion = "UPDATE"
-                    item.status = "ACTUALIZAR_CODIGO_Y_DESC"
-                    item.aplicar = (item.score_oracle_excel >= self.threshold and 
-                                   item.score_actual_nueva >= self.threshold)
-                    stats['update'] += 1
+                    item.accion = "UPDATE_CODIGO_DESCRIPCION"
+                    item.status = "REQUIERE_DECISION_HUMANA"
+                    item.motivo_riesgo = "Similitud media o baja"
+                    item.aplicar = False
+                    item.accion_final = ""
+                    stats['requiere_decision'] += 1
                 
             elif item.existe_actual and item.existe_nuevo and item.codigo_actual != item.codigo_nuevo:
-                item.accion = "BLOQUEADO"
-                item.status = "CODIGO_NUEVO_YA_EXISTE"
+                item.accion = "MOVER_EQUIVALENCIAS_AL_NUEVO"
+                item.status = "REQUIERE_DECISION_HUMANA"
+                item.motivo_riesgo = "Código nuevo ya existe - requiere mover equivs"
                 item.aplicar = False
-                stats['bloqueado'] += 1
+                item.accion_final = ""
+                stats['migrar'] += 1
                 
             elif item.existe_actual and item.existe_nuevo and item.codigo_actual == item.codigo_nuevo:
-                item.accion = "UPDATE"
-                item.status = "ACTUALIZAR_SOLO_DESC"
-                item.aplicar = item.score_oracle_excel >= self.threshold
-                stats['update'] += 1
+                item.accion = "UPDATE_SOLO_DESCRIPCION"
+                item.status = "REQUIERE_DECISION_HUMANA"
+                item.motivo_riesgo = "Ambos códigos existen (mismo código)"
+                item.aplicar = False
+                item.accion_final = ""
+                stats['requiere_decision'] += 1
                 
             elif not item.existe_actual and not item.existe_nuevo:
                 if item.tipo:
-                    item.accion = "INSERT"
-                    item.status = "INSERTAR_NUEVO"
-                    item.aplicar = item.score_actual_nueva >= self.threshold
+                    item.accion = "INSERT_NUEVO"
+                    item.status = "REQUIERE_DECISION_HUMANA"
+                    item.motivo_riesgo = "Código actual no existe, código nuevo no existe"
+                    item.aplicar = False
+                    item.accion_final = ""
                     stats['insert'] += 1
                 else:
-                    item.accion = "BLOQUEADO"
-                    item.status = "FALTA_TIPO"
+                    item.accion = "OMITIR"
+                    item.status = "NO_APLICABLE_TECNICO"
+                    item.motivo_riesgo = "Falta TIPO para INSERT"
                     item.aplicar = False
-                    stats['bloqueado'] += 1
+                    item.accion_final = "OMITIR"
+                    stats['no_aplicable'] += 1
                     
             elif not item.existe_actual and item.existe_nuevo:
-                item.accion = "BLOQUEADO"
-                item.status = "CODIGO_NUEVO_YA_EXISTE_SIN_ACTUAL"
+                item.accion = "ACTUALIZAR_DESC_DEL_NUEVO"
+                item.status = "REQUIERE_DECISION_HUMANA"
+                item.motivo_riesgo = "Código nuevo ya existe sin código actual"
                 item.aplicar = False
-                stats['bloqueado'] += 1
+                item.accion_final = ""
+                stats['requiere_decision'] += 1
+            
+            else:
+                item.accion = "OMITIR"
+                item.status = "NO_APLICABLE_TECNICO"
+                item.motivo_riesgo = "Caso no previsto"
+                item.aplicar = False
+                item.accion_final = "OMITIR"
+                stats['no_aplicable'] += 1
             
             # Contar confidencias
             if item.decision == "ALTA_CONFIANZA":
@@ -347,10 +416,17 @@ class HomologacionEngine:
         return stats
     
     def aplicar_cambios(self) -> dict:
-        """Aplica los cambios seleccionados a la base de datos."""
+        """Aplica los cambios seleccionados a la base de datos.
+        
+        Lógica correcta según foreign keys:
+        - Si tiene equivalencias: INSERT nuevo + UPDATE equivs + DELETE antiguo
+        - Si no tiene equivalencias: UPDATE directo
+        """
         resultados = {
             'updates': 0,
             'inserts': 0,
+            'deletes': 0,
+            'migrate_equiv': 0,
             'errores': [],
         }
         
@@ -358,7 +434,16 @@ class HomologacionEngine:
         
         try:
             for item in items_seleccionados:
-                if item.accion == "UPDATE":
+                accion = item.accion_final if item.accion_final else item.accion
+                
+                # ======================================================
+                # Caso 1: UPDATE directo (código nuevo no existe, sin equivs)
+                # ======================================================
+                if accion == "UPDATE_CODIGO_DESCRIPCION":
+                    # Validar que no tenga equivs
+                    if item.tiene_equivalencias:
+                        raise Exception(f"Código {item.codigo_actual} tiene equivalencias - usar MIGRAR")
+                    
                     self.db.execute(
                         """UPDATE SIS.ITEMS_ISSFA_DETALLE
                            SET CODIGO = :1, DESCRIPCION = :2
@@ -367,8 +452,24 @@ class HomologacionEngine:
                          self.id_itisf, item.codigo_actual)
                     )
                     resultados['updates'] += 1
-                    
-                elif item.accion == "INSERT":
+                
+                # ======================================================
+                # Caso 2: Solo descripción
+                # ======================================================
+                elif accion == "UPDATE_SOLO_DESCRIPCION":
+                    target = item.codigo_nuevo if item.existe_nuevo else item.codigo_actual
+                    self.db.execute(
+                        """UPDATE SIS.ITEMS_ISSFA_DETALLE
+                           SET DESCRIPCION = :1
+                           WHERE ID_ITISF = :2 AND CODIGO = :3""",
+                        (item.descripcion_nueva, self.id_itisf, target)
+                    )
+                    resultados['updates'] += 1
+                
+                # ======================================================
+                # Caso 3: INSERT nuevo código
+                # ======================================================
+                elif accion == "INSERT_NUEVO":
                     self.db.execute(
                         """INSERT INTO SIS.ITEMS_ISSFA_DETALLE
                                (ID_ITISF, CODIGO, DESCRIPCION, TIPO)
@@ -377,6 +478,83 @@ class HomologacionEngine:
                          item.descripcion_nueva, item.tipo)
                     )
                     resultados['inserts'] += 1
+                
+                # ======================================================
+                # Caso 4: MIGRAR código y equivalencias (con FK)
+                # ======================================================
+                elif accion == "MIGRAR_CODIGO_Y_EQUIVALENCIAS":
+                    # Paso 1: Insertar nuevo código en DETALLE
+                    self.db.execute(
+                        """INSERT INTO SIS.ITEMS_ISSFA_DETALLE
+                               (ID_ITISF, CODIGO, DESCRIPCION, TIPO)
+                           VALUES (:1, :2, :3, :4)""",
+                        (self.id_itisf, item.codigo_nuevo, 
+                         item.descripcion_nueva, item.tipo)
+                    )
+                    resultados['inserts'] += 1
+                    
+                    # Paso 2: Mover equivalencias al nuevo código
+                    self.db.execute(
+                        """UPDATE SIS.EQUIVALENCIAS_ITEMS_ISSFA
+                           SET CODIGO_ISSFA = :1
+                           WHERE ID_ITISF = :2 AND CODIGO_ISSFA = :3""",
+                        (item.codigo_nuevo, self.id_itisf, item.codigo_actual)
+                    )
+                    resultados['migrate_equiv'] += 1
+                    
+                    # Paso 3: Eliminar código anterior (ya sin equivs)
+                    # Primero verificar que no tenga equivs
+                    check = self.db.execute(
+                        """SELECT COUNT(*) FROM SIS.EQUIVALENCIAS_ITEMS_ISSFA
+                           WHERE ID_ITISF = :1 AND CODIGO_ISSFA = :2""",
+                        (self.id_itisf, item.codigo_actual)
+                    )
+                    if check and check[0][0] == 0:
+                        self.db.execute(
+                            """DELETE FROM SIS.ITEMS_ISSFA_DETALLE
+                               WHERE ID_ITISF = :1 AND CODIGO = :2""",
+                            (self.id_itisf, item.codigo_actual)
+                        )
+                        resultados['deletes'] += 1
+                
+                # ======================================================
+                # Caso 5: Actualizar descripción del código nuevo existente
+                # ======================================================
+                elif accion == "ACTUALIZAR_DESC_DEL_NUEVO":
+                    self.db.execute(
+                        """UPDATE SIS.ITEMS_ISSFA_DETALLE
+                           SET DESCRIPCION = :1
+                           WHERE ID_ITISF = :2 AND CODIGO = :3""",
+                        (item.descripcion_nueva, self.id_itisf, item.codigo_nuevo)
+                    )
+                    resultados['updates'] += 1
+                
+                # ======================================================
+                # Caso 6: Mover equivalencias al código nuevo existente
+                # ======================================================
+                elif accion == "MOVER_EQUIVALENCIAS_AL_NUEVO":
+                    # Mover todas las equivs del código actual al nuevo
+                    self.db.execute(
+                        """UPDATE SIS.EQUIVALENCIAS_ITEMS_ISSFA
+                           SET CODIGO_ISSFA = :1
+                           WHERE ID_ITISF = :2 AND CODIGO_ISSFA = :3""",
+                        (item.codigo_nuevo, self.id_itisf, item.codigo_actual)
+                    )
+                    resultados['migrate_equiv'] += 1
+                    
+                    # Eliminar código anterior si quedó sin equivs
+                    check = self.db.execute(
+                        """SELECT COUNT(*) FROM SIS.EQUIVALENCIAS_ITEMS_ISSFA
+                           WHERE ID_ITISF = :1 AND CODIGO_ISSFA = :2""",
+                        (self.id_itisf, item.codigo_actual)
+                    )
+                    if check and check[0][0] == 0:
+                        self.db.execute(
+                            """DELETE FROM SIS.ITEMS_ISSFA_DETALLE
+                               WHERE ID_ITISF = :1 AND CODIGO = :2""",
+                            (self.id_itisf, item.codigo_actual)
+                        )
+                        resultados['deletes'] += 1
             
             self.db.commit()
             
@@ -395,7 +573,8 @@ class HomologacionEngine:
             writer = csv.writer(f, delimiter=';')
             
             writer.writerow([
-                'FECHA', 'FILA_EXCEL', 'ACCION', 'STATUS', 'DECISION',
+                'FECHA', 'FILA_EXCEL', 'ACCION_SUGERIDA', 'ACCION_FINAL', 'STATUS',
+                'DECISION', 'MOTIVO_RIESGO',
                 'CODIGO_ACTUAL', 'DESC_ACTUAL_ORACLE', 'DESC_ACTUAL_EXCEL',
                 'CODIGO_NUEVO', 'DESC_NUEVA',
                 'TIPO', 'SCORE_ORACLE_EXCEL', 'SCORE_ACTUAL_NUEVA',
@@ -408,8 +587,10 @@ class HomologacionEngine:
                     fecha,
                     item.fila_excel,
                     item.accion,
+                    item.accion_final or item.accion,
                     item.status,
                     item.decision,
+                    item.motivo_riesgo,
                     item.codigo_actual,
                     item.descripcion_actual_oracle,
                     item.descripcion_actual_excel,

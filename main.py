@@ -13,7 +13,8 @@ from PyQt6.QtWidgets import (
     QLabel, QLineEdit, QPushButton, QFileDialog, QTableWidget,
     QTableWidgetItem, QHeaderView, QMessageBox, QProgressBar,
     QStatusBar, QCheckBox, QComboBox, QSpinBox, QGroupBox,
-    QScrollArea, QSplitter, QFrame, QDialog, QTabWidget
+    QScrollArea, QSplitter, QFrame, QDialog, QTabWidget,
+    QAbstractItemView, QTextEdit, QDialogButtonBox
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
 from PyQt6.QtGui import QFont, QColor
@@ -222,11 +223,11 @@ class MainWindow(QMainWindow):
         self.lbl_total = QLabel("Total: 0")
         self.lbl_update = QLabel("UPDATE: 0")
         self.lbl_insert = QLabel("INSERT: 0")
-        self.lbl_bloqueado = QLabel("BLOQUEADO: 0")
+        self.lbl_decision = QLabel("DECISIÓN: 0")
         self.lbl_confianza = QLabel("Alta confianza: 0")
         
         for lbl in [self.lbl_total, self.lbl_update, self.lbl_insert, 
-                    self.lbl_bloqueado, self.lbl_confianza]:
+                    self.lbl_decision, self.lbl_confianza]:
             lbl.setFont(QFont("Arial", 10, QFont.Weight.Bold))
             stats_layout.addWidget(lbl)
         
@@ -242,12 +243,38 @@ class MainWindow(QMainWindow):
             'Score Oracle/Excel', 'Score Actual/Nueva',
             'Existe', 'Tipo'
         ])
-        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        
+        # ======================================================
+        # NUEVO: Configuración visual de tabla para textos largos
+        # ======================================================
+        
+        self.table.setWordWrap(True)
+        self.table.setTextElideMode(Qt.TextElideMode.ElideNone)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        
+        # Permite que el usuario estire columnas manualmente
+        header = self.table.horizontalHeader()
+        header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        header.setStretchLastSection(False)
+        
+        self.table.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.table.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.table.verticalHeader().setDefaultSectionSize(60)
+        
         self.table.setAlternatingRowColors(True)
         self.table.setStyleSheet("""
             QTableWidget { font-size: 11px; }
             QTableWidget::item { padding: 4px; }
         """)
+        
+        # Doble clic para ver detalle completo
+        self.table.cellDoubleClicked.connect(self.show_row_detail)
+        
+        # ======================================================
+        # FIN NUEVO
+        # ======================================================
+        
         main_layout.addWidget(self.table)
         
         # Barra de progreso
@@ -339,10 +366,10 @@ class MainWindow(QMainWindow):
     
     def mostrar_stats(self, stats):
         self.lbl_total.setText(f"Total: {stats['total']}")
-        self.lbl_update.setText(f"UPDATE: {stats['update']}")
+        self.lbl_update.setText(f"AUTO: {stats['update_auto']}")
         self.lbl_insert.setText(f"INSERT: {stats['insert']}")
-        self.lbl_bloqueado.setText(f"BLOQUEADO: {stats['bloqueado']}")
-        self.lbl_confianza.setText(f"Alta confianza: {stats['alta_confianza']}")
+        self.lbl_decision.setText(f"MIGR: {stats['migrar']}")
+        self.lbl_confianza.setText(f"Alta: {stats['alta_confianza']}")
     
     def mostrar_tabla(self, success, message):
         self.progress_bar.setVisible(False)
@@ -361,11 +388,23 @@ class MainWindow(QMainWindow):
             checkbox.stateChanged.connect(lambda s, i=row: self.toggle_aplicar(i, s))
             self.table.setCellWidget(row, 0, checkbox)
             
-            # Datos
+            # Determinar opciones y acción actual
+            opciones = item.get_opciones_disponibles()
+            accion_actual = item.accion_final if item.accion_final else item.accion
+            
+            # Combo para acción final (columna 2)
+            combo = QComboBox()
+            combo.addItems(opciones)
+            if accion_actual in opciones:
+                combo.setCurrentText(accion_actual)
+            combo.currentTextChanged.connect(lambda text, r=row: self.on_accion_final_changed(r, text))
+            self.table.setCellWidget(row, 2, combo)
+            
+            # Datos: Fila, Estado, Acción sugerida
             datos = [
                 str(item.fila_excel),
-                item.accion,
                 item.status,
+                item.accion,
                 item.decision,
                 item.codigo_actual,
                 item.descripcion_actual_oracle[:50] if item.descripcion_actual_oracle else "",
@@ -381,15 +420,36 @@ class MainWindow(QMainWindow):
             for col, valor in enumerate(datos, 1):
                 cell = QTableWidgetItem(valor)
                 
-                # Colorear según acción
-                if item.accion == "BLOQUEADO":
+                cell.setToolTip(str(valor))
+                cell.setTextAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
+                
+                # Colorear según estado
+                if item.status == "NO_APLICABLE_TECNICO":
                     cell.setBackground(QColor("#ffcccc"))
-                elif item.aplicar and item.decision == "ALTA_CONFIANZA":
+                elif item.status == "REQUIERE_DECISION_HUMANA":
+                    cell.setBackground(QColor("#fff3cd"))
+                elif item.status == "APLICABLE_AUTOMATICO":
                     cell.setBackground(QColor("#ccffcc"))
-                elif item.aplicar:
-                    cell.setBackground(QColor("#ffffcc"))
                 
                 self.table.setItem(row, col, cell)
+        
+        # Ajustar altura de filas
+        self.table.resizeRowsToContents()
+        for row_index in range(self.table.rowCount()):
+            if self.table.rowHeight(row_index) > 140:
+                self.table.setRowHeight(row_index, 140)
+    
+    def on_accion_final_changed(self, row, text):
+        """Cuando el usuario cambia la acción final en el combo."""
+        if self.engine and row < len(self.engine.items):
+            item = self.engine.items[row]
+            item.accion_final = text
+            # Si选择了 algo distinto a OMITIR, marcar como aplicar
+            item.aplicar = text != "OMITIR"
+            # Actualizar checkbox
+            checkbox = self.table.cellWidget(row, 0)
+            if checkbox:
+                checkbox.setChecked(item.aplicar)
     
     def toggle_aplicar(self, row, state):
         if self.engine and row < len(self.engine.items):
@@ -400,14 +460,16 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Aviso", "Primero analice el archivo")
             return
         
-        # Contar por tipo de acción
-        updates = [i for i in self.engine.items if i.aplicar and i.accion == "UPDATE"]
-        inserts = [i for i in self.engine.items if i.aplicar and i.accion == "INSERT"]
-        bloqueados = [i for i in self.engine.items if i.accion == "BLOQUEADO"]
-        desmarcados = [i for i in self.engine.items if not i.aplicar and i.accion not in ["BLOQUEADO", ""]]
+        # Contar por acción final
+        items_para_aplicar = [i for i in self.engine.items if i.aplicar]
         
-        total_aplicar = len(updates) + len(inserts)
-        if total_aplicar == 0:
+        # Agrupar por tipo de acción final
+        counts = {}
+        for item in items_para_aplicar:
+            accion = item.accion_final if item.accion_final else item.accion
+            counts[accion] = counts.get(accion, 0) + 1
+        
+        if not items_para_aplicar:
             QMessageBox.warning(self, "Aviso", "No hay filas seleccionadas para aplicar")
             return
         
@@ -416,33 +478,27 @@ class MainWindow(QMainWindow):
         msg += "RESUMEN DE ACCIONES EN BASE DE DATOS\n"
         msg += "=" * 60 + "\n\n"
         msg += "Tabla afectada:\n"
-        msg += "  • SIS.ITEMS_ISSFA_DETALLE\n\n"
-        msg += "Acciones:\n"
-        msg += f"  • UPDATE: {len(updates)} registro(s)\n"
-        msg += f"  • INSERT: {len(inserts)} registro(s)\n"
-        msg += f"  • BLOQUEADOS: {len(bloqueados)} registro(s)\n"
-        msg += f"  • DESMARCADOS: {len(desmarcados)} registro(s)\n\n"
-        msg += "NO se tocará:\n"
-        msg += "  • SIS.ITEMS_ISSFA_CABECERA\n"
-        msg += "  • SIS.EQUIVALENCIAS_ITEMS_ISSFA (salvo validación)\n\n"
+        msg += "  • SIS.ITEMS_ISSFA_DETALLE\n"
+        msg += "  • SIS.EQUIVALENCIAS_ITEMS_ISSFA (si aplica UPDATE_CON_EQUIVALENCIAS)\n\n"
+        msg += "Acciones por tipo:\n"
+        for accion, count in sorted(counts.items()):
+            msg += f"  • {accion}: {count} registro(s)\n"
+        msg += "\nNO se tocará:\n"
+        msg += "  • SIS.ITEMS_ISSFA_CABECERA\n\n"
         
-        # Detalle de Updates
-        if updates:
-            msg += "Detalle UPDATE:\n"
-            for item in updates[:10]:  # Solo primeros 10
-                msg += f"  {item.codigo_actual} → {item.codigo_nuevo}\n"
-            if len(updates) > 10:
-                msg += f"  ... y {len(updates) - 10} más\n"
-            msg += "\n"
-        
-        # Detalle de Inserts
-        if inserts:
-            msg += "Detalle INSERT:\n"
-            for item in inserts[:10]:  # Solo primeros 10
-                msg += f"  {item.codigo_nuevo} ({item.tipo})\n"
-            if len(inserts) > 10:
-                msg += f"  ... y {len(inserts) - 10} más\n"
-            msg += "\n"
+        # Detalle por acción
+        for accion in sorted(counts.keys()):
+            items_accion = [i for i in items_para_aplicar if (i.accion_final or i.accion) == accion][:5]
+            if items_accion:
+                msg += f"Detalle {accion}:\n"
+                for item in items_accion:
+                    if accion == "INSERT":
+                        msg += f"  + {item.codigo_nuevo} ({item.tipo})\n"
+                    else:
+                        msg += f"  {item.codigo_actual} → {item.codigo_nuevo}\n"
+                if len([i for i in items_para_aplicar if (i.accion_final or i.accion) == accion]) > 5:
+                    msg += f"  ... y más\n"
+                msg += "\n"
         
         msg += "-" * 60 + "\n"
         msg += "La operación se ejecutará dentro de una transacción.\n"
@@ -493,6 +549,73 @@ class MainWindow(QMainWindow):
         if not self.engine:
             QMessageBox.warning(self, "Aviso", "No hay backup disponible")
             return
+    
+    def show_row_detail(self, row: int, column: int):
+        """Muestra detalle completo de una fila seleccionada."""
+        if row < 0 or row >= len(self.engine.items):
+            return
+        
+        item = self.engine.items[row]
+        opciones = item.get_opciones_disponibles()
+        
+        lines = []
+        lines.append("=" * 60)
+        lines.append("DETALLE COMPLETO DE LA FILA")
+        lines.append("=" * 60)
+        lines.append("")
+        lines.append(f"Fila Excel: {item.fila_excel}")
+        lines.append(f"Estado: {item.status}")
+        lines.append(f"Acción sugerida: {item.accion}")
+        lines.append(f"Acción final: {item.accion_final or '(pendiente)'}")
+        lines.append(f"Decisión: {item.decision}")
+        lines.append("")
+        if item.motivo_riesgo:
+            lines.append(f"⚠️ Motivo de riesgo: {item.motivo_riesgo}")
+            lines.append("")
+        lines.append("Opciones disponibles:")
+        for opt in opciones:
+            lines.append(f"  • {opt}")
+        lines.append("")
+        lines.append(f"Aplicar: {'Sí' if item.aplicar else 'No'}")
+        lines.append("")
+        lines.append(f"Código actual: {item.codigo_actual}")
+        lines.append(f"Existe en Oracle: {'Sí' if item.existe_actual else 'No'}")
+        lines.append("")
+        lines.append("Descripción actual Excel:")
+        lines.append(str(item.descripcion_actual_excel))
+        lines.append("")
+        lines.append("Descripción actual Oracle:")
+        lines.append(str(item.descripcion_actual_oracle))
+        lines.append("")
+        lines.append(f"Código nuevo: {item.codigo_nuevo}")
+        lines.append(f"Existe en Oracle: {'Sí' if item.existe_nuevo else 'No'}")
+        lines.append("")
+        lines.append("Descripción nueva:")
+        lines.append(str(item.descripcion_nueva))
+        lines.append("")
+        lines.append(f"Tipo: {item.tipo}")
+        lines.append(f"Score Oracle/Excel: {item.score_oracle_excel:.1f}%")
+        lines.append(f"Score Actual/Nueva: {item.score_actual_nueva:.1f}%")
+        lines.append("")
+        lines.append(f"Tiene equivalencias: {'Sí' if item.tiene_equivalencias else 'No'}")
+        
+        dialog = QDialog(self)
+        dialog.setWindowTitle("🔍 Detalle de la Fila")
+        dialog.resize(900, 650)
+        
+        text = QTextEdit()
+        text.setReadOnly(True)
+        text.setPlainText("\n".join(lines))
+        
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        buttons.rejected.connect(dialog.reject)
+        
+        layout = QVBoxLayout()
+        layout.addWidget(text)
+        layout.addWidget(buttons)
+        
+        dialog.setLayout(layout)
+        dialog.exec()
         
         reply = QMessageBox.question(
             self, "Restaurar Backup",
