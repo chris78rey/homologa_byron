@@ -1,0 +1,21 @@
+# Virtual environment
+venv/
+*.pyc
+__pycache__/
+*.egg-info/
+
+# Entorno local
+.env
+.env.local
+*.log
+app.log
+
+# Excel generados
+*.xlsx
+!resources/templates/*.xlsx
+!ejemplo_homologacion.xlsx
+
+# Documentación que no debe ir
+04.md
+*.bak
+*.swp
