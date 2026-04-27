@@ -24,6 +24,54 @@ from homology import HomologacionEngine
 from config import get_template_excel_path
 
 
+# ======================================================
+# Etiquetas humanas para acciones y estados
+# ======================================================
+
+ACTION_LABELS = {
+    "UPDATE_CODIGO_DESCRIPCION": "Cambiar código y descripción",
+    "UPDATE_SOLO_DESCRIPCION": "Cambiar solo descripción",
+    "INSERT_NUEVO": "Insertar nuevo código",
+    "MIGRAR_CODIGO_Y_EQUIVALENCIAS": "Cambiar código y mover equivalencias",
+    "ACTUALIZAR_DESC_DEL_NUEVO": "Cambiar descripción del código nuevo existente",
+    "MOVER_EQUIVALENCIAS_AL_NUEVO": "Mover equivalencias al código nuevo",
+    "OMITIR": "No aplicar esta fila",
+    "": "Pendiente de decisión",
+}
+
+LABEL_TO_ACTION = {v: k for k, v in ACTION_LABELS.items()}
+
+STATUS_LABELS = {
+    "APLICABLE_AUTOMATICO": "Aplicable automáticamente",
+    "REQUIERE_DECISION_HUMANA": "Requiere decisión humana",
+    "NO_APLICABLE_TECNICO": "No aplicable técnicamente",
+}
+
+DECISION_LABELS = {
+    "ALTA_CONFIANZA": "Alta confianza",
+    "REVISAR": "Revisar",
+    "NO_RECOMENDADO": "No recomendado",
+}
+
+
+def action_label(action: str) -> str:
+    return ACTION_LABELS.get(action, action or "Pendiente de decisión")
+
+
+def action_value(label: str) -> str:
+    return LABEL_TO_ACTION.get(label, label)
+
+
+def status_label(status: str) -> str:
+    return STATUS_LABELS.get(status, status)
+
+
+def decision_label(decision: str) -> str:
+    return DECISION_LABELS.get(decision, decision)
+
+# ======================================================
+
+
 class LoginDialog(QDialog):
     """Diálogo de login - solo una vez."""
     
@@ -233,19 +281,60 @@ class MainWindow(QMainWindow):
         
         main_layout.addWidget(stats_frame)
         
-        # Tabla de resultados
+        # Tabla de resultados - columnas ordenadas para comparar
         self.table = QTableWidget()
-        self.table.setColumnCount(14)
-        self.table.setHorizontalHeaderLabels([
-            'Aplicar', 'Fila', 'Acción', 'Estado', 'Decisión',
-            'Código Actual', 'Desc. Actual Oracle', 'Desc. Actual Excel',
-            'Código Nuevo', 'Desc. Nueva',
-            'Score Oracle/Excel', 'Score Actual/Nueva',
-            'Existe', 'Tipo'
-        ])
         
         # ======================================================
-        # NUEVO: Configuración visual de tabla para textos largos
+        # Tabla ordenada para comparar anterior vs nuevo
+        # ======================================================
+        
+        self.table.setColumnCount(17)
+        self.table.setHorizontalHeaderLabels([
+            "Aplicar",
+            "Fila",
+            "Estado",
+            "Acción sugerida",
+            "Acción final",
+            "Código actual",
+            "Código nuevo",
+            "Descripción actual Excel",
+            "Descripción actual Oracle",
+            "Descripción nueva",
+            "Score Oracle/Excel",
+            "Score Actual/Nueva",
+            "Existe actual",
+            "Existe nuevo",
+            "Tiene equivs",
+            "Tipo",
+            "Observación / riesgo",
+        ])
+        
+        # Anchos iniciales para mejor visualización
+        column_widths = {
+            0: 70,    # Aplicar
+            1: 60,    # Fila
+            2: 180,   # Estado
+            3: 230,   # Acción sugerida
+            4: 260,   # Acción final
+            5: 130,   # Código actual
+            6: 130,   # Código nuevo
+            7: 350,   # Descripción actual Excel
+            8: 350,   # Descripción actual Oracle
+            9: 350,   # Descripción nueva
+            10: 120,  # Score Oracle/Excel
+            11: 120,  # Score Actual/Nueva
+            12: 100,  # Existe actual
+            13: 100,  # Existe nuevo
+            14: 100,  # Tiene equivs
+            15: 70,   # Tipo
+            16: 300,  # Observación
+        }
+        
+        for column_index, width in column_widths.items():
+            self.table.setColumnWidth(column_index, width)
+        
+        # ======================================================
+        # Configuración visual para textos largos
         # ======================================================
         
         self.table.setWordWrap(True)
@@ -253,7 +342,6 @@ class MainWindow(QMainWindow):
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         
-        # Permite que el usuario estire columnas manualmente
         header = self.table.horizontalHeader()
         header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
         header.setStretchLastSection(False)
@@ -268,11 +356,8 @@ class MainWindow(QMainWindow):
             QTableWidget::item { padding: 4px; }
         """)
         
-        # Doble clic para ver detalle completo
         self.table.cellDoubleClicked.connect(self.show_row_detail)
         
-        # ======================================================
-        # FIN NUEVO
         # ======================================================
         
         main_layout.addWidget(self.table)
@@ -372,6 +457,12 @@ class MainWindow(QMainWindow):
         self.lbl_confianza.setText(f"Alta: {stats['alta_confianza']}")
     
     def mostrar_tabla(self, success, message):
+        """
+        Muestra la vista previa con columnas ordenadas:
+        - Código actual junto a código nuevo
+        - Descripción actual junto a descripción nueva
+        - Acción sugerida y acción final entendibles
+        """
         self.progress_bar.setVisible(False)
         self.statusBar().showMessage(message)
         
@@ -382,48 +473,54 @@ class MainWindow(QMainWindow):
         self.table.setRowCount(len(self.engine.items))
         
         for row, item in enumerate(self.engine.items):
-            # Checkbox aplicar
+            # Columna 0: checkbox aplicar
             checkbox = QCheckBox()
             checkbox.setChecked(item.aplicar)
             checkbox.stateChanged.connect(lambda s, i=row: self.toggle_aplicar(i, s))
             self.table.setCellWidget(row, 0, checkbox)
             
-            # Determinar opciones y acción actual
-            opciones = item.get_opciones_disponibles()
-            accion_actual = item.accion_final if item.accion_final else item.accion
+            # Columna 4: combo de acción final en lenguaje humano
+            opciones_internas = item.get_opciones_disponibles()
+            opciones_humanas = [action_label(op) for op in opciones_internas]
             
-            # Combo para acción final (columna 2)
+            accion_actual_interna = item.accion_final if item.accion_final else item.accion
+            accion_actual_humana = action_label(accion_actual_interna)
+            
             combo = QComboBox()
-            combo.addItems(opciones)
-            if accion_actual in opciones:
-                combo.setCurrentText(accion_actual)
-            combo.currentTextChanged.connect(lambda text, r=row: self.on_accion_final_changed(r, text))
-            self.table.setCellWidget(row, 2, combo)
+            combo.addItems(opciones_humanas)
+            if accion_actual_humana in opciones_humanas:
+                combo.setCurrentText(accion_actual_humana)
+            combo.currentTextChanged.connect(
+                lambda text, r=row: self.on_accion_final_changed(r, text)
+            )
+            self.table.setCellWidget(row, 4, combo)
             
-            # Datos: Fila, Estado, Acción sugerida
-            datos = [
-                str(item.fila_excel),
-                item.status,
-                item.accion,
-                item.decision,
-                item.codigo_actual,
-                item.descripcion_actual_oracle[:50] if item.descripcion_actual_oracle else "",
-                item.descripcion_actual_excel[:50],
-                item.codigo_nuevo,
-                item.descripcion_nueva[:50],
-                f"{item.score_oracle_excel:.1f}%",
-                f"{item.score_actual_nueva:.1f}%",
-                "S" if item.existe_actual else "N",
-                item.tipo,
-            ]
+            # Datos completos - NO se corta texto con [:50]
+            datos = {
+                1: str(item.fila_excel),
+                2: status_label(item.status),
+                3: action_label(item.accion),
+                5: item.codigo_actual,
+                6: item.codigo_nuevo,
+                7: item.descripcion_actual_excel,
+                8: item.descripcion_actual_oracle,
+                9: item.descripcion_nueva,
+                10: f"{item.score_oracle_excel:.1f}%",
+                11: f"{item.score_actual_nueva:.1f}%",
+                12: "Sí" if item.existe_actual else "No",
+                13: "Sí" if item.existe_nuevo else "No",
+                14: "Sí" if item.tiene_equivalencias else "No",
+                15: item.tipo,
+                16: item.motivo_riesgo,
+            }
             
-            for col, valor in enumerate(datos, 1):
-                cell = QTableWidgetItem(valor)
+            for col, valor in datos.items():
+                cell = QTableWidgetItem(str(valor or ""))
+                cell.setToolTip(str(valor or ""))
+                cell.setTextAlignment(
+                    Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft
+                )
                 
-                cell.setToolTip(str(valor))
-                cell.setTextAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
-                
-                # Colorear según estado
                 if item.status == "NO_APLICABLE_TECNICO":
                     cell.setBackground(QColor("#ffcccc"))
                 elif item.status == "REQUIERE_DECISION_HUMANA":
@@ -433,20 +530,23 @@ class MainWindow(QMainWindow):
                 
                 self.table.setItem(row, col, cell)
         
-        # Ajustar altura de filas
         self.table.resizeRowsToContents()
         for row_index in range(self.table.rowCount()):
-            if self.table.rowHeight(row_index) > 140:
-                self.table.setRowHeight(row_index, 140)
+            if self.table.rowHeight(row_index) > 160:
+                self.table.setRowHeight(row_index, 160)
     
     def on_accion_final_changed(self, row, text):
-        """Cuando el usuario cambia la acción final en el combo."""
+        """
+        Cuando el usuario cambia la acción final en el combo.
+        La pantalla muestra texto humano, internamente se guarda el código técnico.
+        """
         if self.engine and row < len(self.engine.items):
             item = self.engine.items[row]
-            item.accion_final = text
-            # Si选择了 algo distinto a OMITIR, marcar como aplicar
-            item.aplicar = text != "OMITIR"
-            # Actualizar checkbox
+            
+            accion_interna = action_value(text)
+            item.accion_final = accion_interna
+            item.aplicar = accion_interna != "OMITIR"
+            
             checkbox = self.table.cellWidget(row, 0)
             if checkbox:
                 checkbox.setChecked(item.aplicar)
@@ -564,44 +664,46 @@ class MainWindow(QMainWindow):
         lines.append("=" * 60)
         lines.append("")
         lines.append(f"Fila Excel: {item.fila_excel}")
-        lines.append(f"Estado: {item.status}")
-        lines.append(f"Acción sugerida: {item.accion}")
-        lines.append(f"Acción final: {item.accion_final or '(pendiente)'}")
-        lines.append(f"Decisión: {item.decision}")
+        lines.append(f"Estado: {status_label(item.status)}")
+        lines.append(f"Acción sugerida: {action_label(item.accion)}")
+        lines.append(f"Acción final: {action_label(item.accion_final or item.accion)}")
+        lines.append(f"Decisión: {decision_label(item.decision)}")
         lines.append("")
         if item.motivo_riesgo:
-            lines.append(f"⚠️ Motivo de riesgo: {item.motivo_riesgo}")
+            lines.append(f"⚠️ Observación: {item.motivo_riesgo}")
             lines.append("")
         lines.append("Opciones disponibles:")
         for opt in opciones:
-            lines.append(f"  • {opt}")
+            lines.append(f"  • {action_label(opt)}")
         lines.append("")
         lines.append(f"Aplicar: {'Sí' if item.aplicar else 'No'}")
         lines.append("")
+        lines.append("COMPARACIÓN DE CÓDIGOS")
+        lines.append("-" * 60)
         lines.append(f"Código actual: {item.codigo_actual}")
         lines.append(f"Existe en Oracle: {'Sí' if item.existe_actual else 'No'}")
         lines.append("")
+        lines.append("COMPARACIÓN DE DESCRIPCIONES")
+        lines.append("-" * 60)
         lines.append("Descripción actual Excel:")
         lines.append(str(item.descripcion_actual_excel))
         lines.append("")
         lines.append("Descripción actual Oracle:")
         lines.append(str(item.descripcion_actual_oracle))
         lines.append("")
-        lines.append(f"Código nuevo: {item.codigo_nuevo}")
-        lines.append(f"Existe en Oracle: {'Sí' if item.existe_nuevo else 'No'}")
-        lines.append("")
         lines.append("Descripción nueva:")
         lines.append(str(item.descripcion_nueva))
         lines.append("")
-        lines.append(f"Tipo: {item.tipo}")
+        lines.append("METRICAS")
+        lines.append("-" * 60)
         lines.append(f"Score Oracle/Excel: {item.score_oracle_excel:.1f}%")
         lines.append(f"Score Actual/Nueva: {item.score_actual_nueva:.1f}%")
-        lines.append("")
+        lines.append(f"Tipo: {item.tipo}")
         lines.append(f"Tiene equivalencias: {'Sí' if item.tiene_equivalencias else 'No'}")
         
         dialog = QDialog(self)
-        dialog.setWindowTitle("🔍 Detalle de la Fila")
-        dialog.resize(900, 650)
+        dialog.setWindowTitle("🔍 Detalle completo de la fila")
+        dialog.resize(1000, 700)
         
         text = QTextEdit()
         text.setReadOnly(True)
@@ -616,11 +718,27 @@ class MainWindow(QMainWindow):
         
         dialog.setLayout(layout)
         dialog.exec()
+    
+    def restaurar_backup(self):
+        """
+        Restaura backup únicamente cuando el usuario presiona
+        el botón rojo 'Restaurar Backup'.
+        """
+        if not self.engine:
+            QMessageBox.warning(self, "Aviso", "No hay backup disponible")
+            return
         
         reply = QMessageBox.question(
-            self, "Restaurar Backup",
-            "¿Restaurar datos al estado anterior?",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+            self,
+            "Restaurar Backup",
+            "Esta acción restaurará las tablas desde el backup creado por esta ejecución.\n\n"
+            "Se reemplazará el contenido actual de:\n"
+            "• SIS.EQUIVALENCIAS_ITEMS_ISSFA\n"
+            "• SIS.ITEMS_ISSFA_DETALLE\n\n"
+            "Esta acción es delicada.\n\n"
+            "¿Desea continuar?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
         )
         
         if reply == QMessageBox.StandardButton.Yes:
